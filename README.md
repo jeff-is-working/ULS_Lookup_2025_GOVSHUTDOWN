@@ -15,6 +15,8 @@ python3 uls_importer.py --db uls.db --schema public_access_database_definitions_
 python3 uls_importer.py --db uls.db --import-file l_amat.zip --import-type full
 
 # 3. Apply daily updates
+python3 uls_importer.py --db uls.db --import-file l_am_wed.zip --import-type daily --replace
+
 python3 uls_importer.py --db uls.db --import-file l_am_thu.zip --import-type daily --replace
 
 python3 uls_importer.py --db uls.db --import-file l_am_fri.zip --import-type daily --replace
@@ -27,7 +29,7 @@ python3 uls_importer.py --db uls.db --import-file l_am_mon.zip --import-type dai
 
 python3 uls_importer.py --db uls.db --import-file l_am_tue.zip --import-type daily --replace
 
-python3 uls_importer.py --db uls.db --import-file l_am_wed.zip --import-type daily --replace
+
 
 # 4. Check status
 python3 uls_importer.py --db uls.db --status
