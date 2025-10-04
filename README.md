@@ -9,14 +9,20 @@ Licenses 	164.16 MB 	9/28/2025 l_amat.zip
 https://data.fcc.gov/download/pub/uls/complete/l_amat.zip
 
 https://data.fcc.gov/download/pub/uls/complete/a_amat.zip
+## 2. Import data from downloaded weekly files
+# Import both license and application data
+python3 uls_importer.py --db uls.db --license-file l_amat.zip --app-file a_amat.zip
 
-## 2. Build the uls.db file from schema definition
-python3 uls_importer.py --db uls.db --schema public_access_database_definitions_sql_20250417.txt
+# Import separately
+python3 uls_importer.py --db uls.db --import-file l_amat.zip
+python3 uls_importer.py --db uls.db --import-file a_amat.zip
 
-## 3. Import your weekly db export
-python3 uls_importer.py --db uls.db --import-file l_amat.zip --import-type full
+# Import from directory (will auto-detect and import both types)
+python3 uls_importer.py --db uls.db --import-dir /path/to/uls/files
 
-## 4. Apply daily db updates
+
+
+## 3. Apply daily db updates
 python3 uls_importer.py --db uls.db --import-file l_am_wed.zip --import-type daily --replace
 
 python3 uls_importer.py --db uls.db --import-file l_am_thu.zip --import-type daily --replace
@@ -31,8 +37,11 @@ python3 uls_importer.py --db uls.db --import-file l_am_mon.zip --import-type dai
 
 python3 uls_importer.py --db uls.db --import-file l_am_tue.zip --import-type daily --replace
 
-## 5. Check status
+## 4. Check status
 python3 uls_importer.py --db uls.db --status
+
+## 5. Optimize database
+python3 uls_importer.py --db uls.db --vacuum --analyze
 
 # WebApp Run 
 
