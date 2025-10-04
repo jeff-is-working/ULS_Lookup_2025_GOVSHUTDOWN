@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 FCC ULS Database Web Application
-Provides search interface and CSV export for ULS license data
+Provides search interface and CSV export for ULS license and application data
 """
 
 from flask import Flask, render_template, request, jsonify, send_file, Response
@@ -46,26 +46,16 @@ def get_states():
     results = query_db("SELECT DISTINCT state FROM PUBACC_EN WHERE state IS NOT NULL ORDER BY state")
     return [r['state'] for r in results]
 
-@lru_cache(maxsize=256)
-def get_counties(state=None):
-    """Get list of counties, optionally filtered by state"""
-    if state:
-        results = query_db("""
-            SELECT DISTINCT l.location_county as county 
-            FROM PUBACC_LO l
-            JOIN PUBACC_HD h ON l.call_sign = h.call_sign
-            JOIN PUBACC_EN e ON h.unique_system_identifier = e.unique_system_identifier
-            WHERE e.state = ? AND l.location_county IS NOT NULL
-            ORDER BY l.location_county
-        """, [state])
-    else:
-        results = query_db("""
-            SELECT DISTINCT location_county as county 
-            FROM PUBACC_LO 
-            WHERE location_county IS NOT NULL 
-            ORDER BY location_county
-        """)
-    return [r['county'] for r in results]
+@lru_cache(maxsize=128)
+def get_service_codes():
+    """Get list of radio service codes"""
+    results = query_db("""
+        SELECT DISTINCT radio_service_code 
+        FROM PUBACC_HD 
+        WHERE radio_service_code IS NOT NULL 
+        ORDER BY radio_service_code
+    """)
+    return [r['radio_service_code'] for r in results]
 
 @app.route('/')
 def index():
@@ -74,7 +64,7 @@ def index():
 
 @app.route('/api/search', methods=['GET'])
 def search():
-    """Main search API endpoint"""
+    """Main search API endpoint for both licenses and applications"""
     # Get search parameters
     search_type = request.args.get('type', 'callsign')
     query_value = request.args.get('q', '').strip()
@@ -82,7 +72,7 @@ def search():
     per_page = int(request.args.get('per_page', app.config['PAGE_SIZE']))
     
     # Validate inputs
-    if not query_value and search_type != 'geographic':
+    if not query_value and search_type not in ['geographic', 'recent_applications']:
         return jsonify({'error': 'Search query required'}), 400
     
     if per_page > 200:
@@ -90,7 +80,14 @@ def search():
     
     offset = (page - 1) * per_page
     
-    # Build query based on search type
+    # Route to appropriate search handler
+    if search_type in ['application_file', 'application_status', 'recent_applications']:
+        return search_applications(query_value, page, per_page, offset, search_type)
+    else:
+        return search_licenses(query_value, page, per_page, offset, search_type)
+
+def search_licenses(query_value, page, per_page, offset, search_type):
+    """Search for license data"""
     base_query = """
         SELECT DISTINCT
             h.unique_system_identifier,
@@ -160,7 +157,6 @@ def search():
         # Geographic search with multiple filters
         region = request.args.get('region', '')
         state = request.args.get('state', '')
-        county = request.args.get('county', '')
         city = request.args.get('city', '')
         
         conditions = []
@@ -169,41 +165,12 @@ def search():
             conditions.append("e.state = ?")
             params.append(state.upper())
             
-        if county:
-            # Join with location table for county
-            base_query = """
-                SELECT DISTINCT
-                    h.unique_system_identifier,
-                    h.call_sign,
-                    h.uls_file_number,
-                    h.radio_service_code,
-                    h.grant_date,
-                    h.expired_date,
-                    h.cancellation_date,
-                    h.license_status,
-                    e.entity_name,
-                    e.first_name,
-                    e.last_name,
-                    e.frn,
-                    e.street_address,
-                    e.city,
-                    e.state,
-                    e.zip_code,
-                    e.email,
-                    e.phone
-                FROM PUBACC_HD h
-                LEFT JOIN PUBACC_EN e ON h.unique_system_identifier = e.unique_system_identifier
-                LEFT JOIN PUBACC_LO l ON h.call_sign = l.call_sign
-            """
-            conditions.append("UPPER(l.location_county) LIKE ?")
-            params.append(f"%{county.upper()}%")
-            
         if city:
             conditions.append("UPPER(e.city) LIKE ?")
             params.append(f"%{city.upper()}%")
             
         if region:
-            # Map regions to states (simplified example)
+            # Map regions to states
             region_states = {
                 'northeast': ['CT', 'ME', 'MA', 'NH', 'NJ', 'NY', 'PA', 'RI', 'VT'],
                 'southeast': ['AL', 'AR', 'FL', 'GA', 'KY', 'LA', 'MS', 'NC', 'SC', 'TN', 'VA', 'WV'],
@@ -236,9 +203,12 @@ def search():
         params.append(status_filter)
     
     # Get total count
-    count_query = f"SELECT COUNT(DISTINCT h.unique_system_identifier) as total FROM PUBACC_HD h LEFT JOIN PUBACC_EN e ON h.unique_system_identifier = e.unique_system_identifier {where_clause}"
-    if 'PUBACC_LO' in base_query:
-        count_query = f"SELECT COUNT(DISTINCT h.unique_system_identifier) as total FROM PUBACC_HD h LEFT JOIN PUBACC_EN e ON h.unique_system_identifier = e.unique_system_identifier LEFT JOIN PUBACC_LO l ON h.call_sign = l.call_sign {where_clause}"
+    count_query = f"""
+        SELECT COUNT(DISTINCT h.unique_system_identifier) as total 
+        FROM PUBACC_HD h 
+        LEFT JOIN PUBACC_EN e ON h.unique_system_identifier = e.unique_system_identifier 
+        {where_clause}
+    """
     
     total_result = query_db(count_query, params, one=True)
     total_count = total_result['total'] if total_result else 0
@@ -253,6 +223,7 @@ def search():
     formatted_results = []
     for row in results:
         formatted_results.append({
+            'type': 'license',
             'unique_system_identifier': row['unique_system_identifier'],
             'call_sign': row['call_sign'],
             'uls_file_number': row['uls_file_number'],
@@ -260,6 +231,128 @@ def search():
             'grant_date': row['grant_date'],
             'expired_date': row['expired_date'],
             'license_status': row['license_status'],
+            'entity_name': row['entity_name'] or f"{row['first_name'] or ''} {row['last_name'] or ''}".strip(),
+            'frn': row['frn'],
+            'address': f"{row['street_address'] or ''}, {row['city'] or ''}, {row['state'] or ''} {row['zip_code'] or ''}".strip(', '),
+            'email': row['email'],
+            'phone': row['phone']
+        })
+    
+    return jsonify({
+        'results': formatted_results,
+        'total': total_count,
+        'page': page,
+        'per_page': per_page,
+        'total_pages': (total_count + per_page - 1) // per_page
+    })
+
+def search_applications(query_value, page, per_page, offset, search_type):
+    """Search for application data"""
+    base_query = """
+        SELECT DISTINCT
+            ad.unique_system_identifier,
+            ad.uls_file_number,
+            ad.ebf_number,
+            ad.application_purpose,
+            ad.application_status,
+            ad.receipt_date,
+            ad.notification_date,
+            e.entity_name,
+            e.first_name,
+            e.last_name,
+            e.frn,
+            e.street_address,
+            e.city,
+            e.state,
+            e.zip_code,
+            e.email,
+            e.phone,
+            h.call_sign,
+            h.radio_service_code
+        FROM PUBACC_AD ad
+        LEFT JOIN PUBACC_EN e ON ad.unique_system_identifier = e.unique_system_identifier
+        LEFT JOIN PUBACC_HD h ON ad.unique_system_identifier = h.unique_system_identifier
+    """
+    
+    where_clause = ""
+    params = []
+    
+    if search_type == 'application_file':
+        where_clause = "WHERE ad.uls_file_number = ?"
+        params = [query_value]
+        
+    elif search_type == 'application_status':
+        where_clause = "WHERE ad.application_status = ?"
+        params = [query_value.upper()]
+        
+    elif search_type == 'recent_applications':
+        where_clause = "WHERE ad.receipt_date IS NOT NULL"
+        params = []
+        
+    else:
+        return jsonify({'error': 'Invalid application search type'}), 400
+    
+    # Get total count
+    count_query = f"""
+        SELECT COUNT(DISTINCT ad.uls_file_number) as total 
+        FROM PUBACC_AD ad 
+        LEFT JOIN PUBACC_EN e ON ad.unique_system_identifier = e.unique_system_identifier
+        LEFT JOIN PUBACC_HD h ON ad.unique_system_identifier = h.unique_system_identifier
+        {where_clause}
+    """
+    
+    total_result = query_db(count_query, params, one=True)
+    total_count = total_result['total'] if total_result else 0
+    
+    # Execute main query with pagination
+    order_by = "ORDER BY ad.receipt_date DESC" if search_type == 'recent_applications' else "ORDER BY ad.uls_file_number"
+    full_query = f"{base_query} {where_clause} {order_by} LIMIT ? OFFSET ?"
+    params.extend([per_page, offset])
+    
+    results = query_db(full_query, params)
+    
+    # Format results
+    formatted_results = []
+    for row in results:
+        # Map application purpose codes
+        purpose_map = {
+            'NE': 'New',
+            'AM': 'Amendment',
+            'RO': 'Renewal Only',
+            'RM': 'Renewal/Modification',
+            'AU': 'Administrative Update',
+            'CA': 'Cancellation',
+            'MD': 'Modification',
+            'WD': 'Withdrawal'
+        }
+        
+        # Map application status codes
+        status_map = {
+            'P': 'Pending',
+            'A': 'Accepted',
+            'G': 'Granted',
+            'D': 'Dismissed',
+            'W': 'Withdrawn',
+            'Q': 'Accepted in Part',
+            'T': 'Terminated',
+            'K': 'Killed',
+            'R': 'Returned',
+            'I': 'In Progress'
+        }
+        
+        formatted_results.append({
+            'type': 'application',
+            'unique_system_identifier': row['unique_system_identifier'],
+            'uls_file_number': row['uls_file_number'],
+            'ebf_number': row['ebf_number'],
+            'call_sign': row['call_sign'],
+            'radio_service_code': row['radio_service_code'],
+            'application_purpose': purpose_map.get(row['application_purpose'], row['application_purpose']),
+            'application_purpose_code': row['application_purpose'],
+            'application_status': status_map.get(row['application_status'], row['application_status']),
+            'application_status_code': row['application_status'],
+            'receipt_date': row['receipt_date'],
+            'notification_date': row['notification_date'],
             'entity_name': row['entity_name'] or f"{row['first_name'] or ''} {row['last_name'] or ''}".strip(),
             'frn': row['frn'],
             'address': f"{row['street_address'] or ''}, {row['city'] or ''}, {row['state'] or ''} {row['zip_code'] or ''}".strip(', '),
@@ -283,7 +376,16 @@ def export_csv():
     search_type = data.get('type', 'callsign')
     query_value = data.get('q', '')
     
-    # Build same query as search but without pagination
+    # Determine if this is license or application export
+    is_application = search_type in ['application_file', 'application_status', 'recent_applications']
+    
+    if is_application:
+        return export_applications_csv(data, search_type, query_value)
+    else:
+        return export_licenses_csv(data, search_type, query_value)
+
+def export_licenses_csv(data, search_type, query_value):
+    """Export license data to CSV"""
     base_query = """
         SELECT 
             h.call_sign,
@@ -307,7 +409,6 @@ def export_csv():
         LEFT JOIN PUBACC_EN e ON h.unique_system_identifier = e.unique_system_identifier
     """
     
-    # [Similar WHERE clause building as in search() - abbreviated for space]
     where_clause = ""
     params = []
     
@@ -317,7 +418,7 @@ def export_csv():
     elif search_type == 'frn':
         where_clause = "WHERE e.frn = ?"
         params = [query_value]
-    # ... (implement other search types similarly)
+    # Add other search types as needed
     
     # Limit exports to prevent abuse
     full_query = f"{base_query} {where_clause} LIMIT {app.config['MAX_RESULTS']}"
@@ -353,7 +454,85 @@ def export_csv():
         output.getvalue(),
         mimetype='text/csv',
         headers={
-            'Content-Disposition': f'attachment; filename=uls_export_{timestamp}.csv'
+            'Content-Disposition': f'attachment; filename=uls_licenses_export_{timestamp}.csv'
+        }
+    )
+
+def export_applications_csv(data, search_type, query_value):
+    """Export application data to CSV"""
+    base_query = """
+        SELECT 
+            ad.uls_file_number,
+            ad.ebf_number,
+            ad.unique_system_identifier,
+            ad.application_purpose,
+            ad.application_status,
+            ad.receipt_date,
+            ad.notification_date,
+            h.call_sign,
+            h.radio_service_code,
+            e.entity_name,
+            e.first_name,
+            e.last_name,
+            e.frn,
+            e.street_address,
+            e.city,
+            e.state,
+            e.zip_code,
+            e.email,
+            e.phone
+        FROM PUBACC_AD ad
+        LEFT JOIN PUBACC_EN e ON ad.unique_system_identifier = e.unique_system_identifier
+        LEFT JOIN PUBACC_HD h ON ad.unique_system_identifier = h.unique_system_identifier
+    """
+    
+    where_clause = ""
+    params = []
+    
+    if search_type == 'application_file':
+        where_clause = "WHERE ad.uls_file_number = ?"
+        params = [query_value]
+    elif search_type == 'application_status':
+        where_clause = "WHERE ad.application_status = ?"
+        params = [query_value.upper()]
+    
+    # Limit exports
+    full_query = f"{base_query} {where_clause} LIMIT {app.config['MAX_RESULTS']}"
+    results = query_db(full_query, params)
+    
+    # Create CSV
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    # Write headers
+    writer.writerow([
+        'ULS File Number', 'EBF Number', 'System ID', 'Call Sign', 'Service Code',
+        'Purpose', 'Status', 'Receipt Date', 'Notification Date',
+        'Entity Name', 'First Name', 'Last Name', 'FRN',
+        'Street Address', 'City', 'State', 'ZIP', 'Email', 'Phone'
+    ])
+    
+    # Write data
+    for row in results:
+        writer.writerow([
+            row['uls_file_number'], row['ebf_number'], row['unique_system_identifier'],
+            row['call_sign'], row['radio_service_code'],
+            row['application_purpose'], row['application_status'],
+            row['receipt_date'], row['notification_date'],
+            row['entity_name'], row['first_name'], row['last_name'], row['frn'],
+            row['street_address'], row['city'], row['state'], row['zip_code'],
+            row['email'], row['phone']
+        ])
+    
+    # Create response
+    output.seek(0)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    return Response(
+        output.getvalue(),
+        mimetype='text/csv',
+        headers={
+            'Content-Disposition': f'attachment; filename=uls_applications_export_{timestamp}.csv'
         }
     )
 
@@ -397,11 +576,46 @@ def get_license_detail(callsign):
         LIMIT 20
     """, [callsign.upper()])
     
+    # Get related applications
+    applications = query_db("""
+        SELECT * FROM PUBACC_AD
+        WHERE unique_system_identifier = ?
+        ORDER BY receipt_date DESC
+        LIMIT 10
+    """, [license_data['unique_system_identifier']])
+    
     return jsonify({
         'license': dict(license_data),
         'locations': [dict(l) for l in locations],
         'frequencies': [dict(f) for f in frequencies],
-        'history': [dict(h) for h in history]
+        'history': [dict(h) for h in history],
+        'applications': [dict(a) for a in applications]
+    })
+
+@app.route('/api/application/<file_number>')
+def get_application_detail(file_number):
+    """Get detailed application information"""
+    # Get main application data
+    app_data = query_db("""
+        SELECT ad.*, e.*, h.call_sign, h.radio_service_code
+        FROM PUBACC_AD ad
+        LEFT JOIN PUBACC_EN e ON ad.unique_system_identifier = e.unique_system_identifier
+        LEFT JOIN PUBACC_HD h ON ad.unique_system_identifier = h.unique_system_identifier
+        WHERE ad.uls_file_number = ?
+    """, [file_number], one=True)
+    
+    if not app_data:
+        return jsonify({'error': 'Application not found'}), 404
+    
+    # Get attachments
+    attachments = query_db("""
+        SELECT * FROM PUBACC_AT
+        WHERE uls_file_number = ?
+    """, [file_number])
+    
+    return jsonify({
+        'application': dict(app_data),
+        'attachments': [dict(a) for a in attachments]
     })
 
 @app.route('/api/stats')
@@ -416,6 +630,14 @@ def get_stats():
     # Active licenses
     result = query_db("SELECT COUNT(*) as count FROM PUBACC_HD WHERE license_status = 'A'", one=True)
     stats['active_licenses'] = result['count'] if result else 0
+    
+    # Total applications
+    result = query_db("SELECT COUNT(DISTINCT uls_file_number) as count FROM PUBACC_AD", one=True)
+    stats['total_applications'] = result['count'] if result else 0
+    
+    # Pending applications
+    result = query_db("SELECT COUNT(*) as count FROM PUBACC_AD WHERE application_status = 'P'", one=True)
+    stats['pending_applications'] = result['count'] if result else 0
     
     # By service
     services = query_db("""
@@ -432,6 +654,7 @@ def get_stats():
     result = query_db("""
         SELECT MAX(import_date) as last_update 
         FROM import_tracking
+        WHERE status = 'completed'
     """, one=True)
     stats['last_update'] = result['last_update'] if result and result['last_update'] else 'Unknown'
     
@@ -468,6 +691,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
         .header { background: #2c3e50; color: white; padding: 30px 0; margin: -20px -20px 30px; }
         .header h1 { text-align: center; font-size: 2em; }
+        .header p { text-align: center; margin-top: 10px; opacity: 0.9; }
+        .tabs { display: flex; gap: 10px; margin-bottom: 20px; }
+        .tab { padding: 12px 24px; background: white; border: 2px solid #3498db; color: #3498db; border-radius: 5px; cursor: pointer; font-weight: 600; }
+        .tab.active { background: #3498db; color: white; }
         .search-box { background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-bottom: 30px; }
         .search-type { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
         .search-type button { padding: 10px 20px; border: 2px solid #3498db; background: white; color: #3498db; border-radius: 5px; cursor: pointer; transition: all 0.3s; }
@@ -495,12 +722,19 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .pagination button:disabled { opacity: 0.5; cursor: not-allowed; }
         .loading { text-align: center; padding: 40px; color: #7f8c8d; }
         .error { background: #e74c3c; color: white; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
-        .license-status { padding: 2px 8px; border-radius: 3px; font-size: 12px; font-weight: bold; }
+        .badge { padding: 3px 8px; border-radius: 3px; font-size: 12px; font-weight: bold; display: inline-block; }
+        .badge-license { background: #3498db; color: white; }
+        .badge-application { background: #9b59b6; color: white; }
+        .status-badge { padding: 2px 8px; border-radius: 3px; font-size: 12px; font-weight: bold; }
         .status-A { background: #27ae60; color: white; }
         .status-E { background: #e67e22; color: white; }
         .status-C { background: #e74c3c; color: white; }
+        .status-P { background: #f39c12; color: white; }
+        .status-G { background: #27ae60; color: white; }
+        .status-D { background: #95a5a6; color: white; }
         @media (max-width: 768px) {
             .search-form { flex-direction: column; }
+            .tabs { flex-direction: column; }
             table { font-size: 14px; }
             th, td { padding: 8px; }
         }
@@ -509,10 +743,16 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <body>
     <div class="container">
         <div class="header">
-            <h1>FCC ULS Database Search</h1>
+            <h1>🔍 FCC ULS Database Search</h1>
+            <p>Search Licenses and Applications</p>
         </div>
         
-        <div class="search-box">
+        <div class="tabs">
+            <div class="tab active" data-category="license">📋 License Search</div>
+            <div class="tab" data-category="application">📝 Application Search</div>
+        </div>
+        
+        <div class="search-box" id="licenseSearch">
             <div class="search-type">
                 <button class="active" data-type="callsign">Call Sign</button>
                 <button data-type="frn">FRN</button>
@@ -538,9 +778,31 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 <select id="stateSelect">
                     <option value="">Select State...</option>
                 </select>
-                <input type="text" id="countyInput" placeholder="County...">
                 <input type="text" id="cityInput" placeholder="City...">
             </div>
+        </div>
+        
+        <div class="search-box" id="applicationSearch" style="display: none;">
+            <div class="search-type">
+                <button class="active" data-type="application_file">File Number</button>
+                <button data-type="application_status">Status</button>
+                <button data-type="recent_applications">Recent Applications</button>
+            </div>
+            
+            <form class="search-form" id="appSearchForm">
+                <input type="text" id="appSearchInput" placeholder="Enter application file number..." required>
+                <select id="appStatusSelect" style="display: none;">
+                    <option value="">Select Status...</option>
+                    <option value="P">Pending</option>
+                    <option value="A">Accepted</option>
+                    <option value="G">Granted</option>
+                    <option value="D">Dismissed</option>
+                    <option value="W">Withdrawn</option>
+                    <option value="Q">Accepted in Part</option>
+                    <option value="T">Terminated</option>
+                </select>
+                <button type="submit">Search</button>
+            </form>
         </div>
         
         <div class="results" id="results" style="display: none;">
@@ -552,21 +814,51 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             <div class="pagination" id="pagination"></div>
         </div>
         
-        <div class="loading" id="loading" style="display: none;">Loading...</div>
+        <div class="loading" id="loading" style="display: none;">⏳ Loading...</div>
     </div>
     
     <script>
+        let currentCategory = 'license';
         let currentSearchType = 'callsign';
         let currentSearchParams = {};
         let currentPage = 1;
         
-        // Search type buttons
-        document.querySelectorAll('.search-type button').forEach(btn => {
+        // Tab switching
+        document.querySelectorAll('.tabs .tab').forEach(tab => {
+            tab.addEventListener('click', function() {
+                document.querySelectorAll('.tabs .tab').forEach(t => t.classList.remove('active'));
+                this.classList.add('active');
+                currentCategory = this.dataset.category;
+                
+                document.getElementById('licenseSearch').style.display = currentCategory === 'license' ? 'block' : 'none';
+                document.getElementById('applicationSearch').style.display = currentCategory === 'application' ? 'block' : 'none';
+                document.getElementById('results').style.display = 'none';
+                
+                if (currentCategory === 'application') {
+                    currentSearchType = 'application_file';
+                } else {
+                    currentSearchType = 'callsign';
+                }
+            });
+        });
+        
+        // License search type buttons
+        document.querySelectorAll('#licenseSearch .search-type button').forEach(btn => {
             btn.addEventListener('click', function() {
-                document.querySelectorAll('.search-type button').forEach(b => b.classList.remove('active'));
+                document.querySelectorAll('#licenseSearch .search-type button').forEach(b => b.classList.remove('active'));
                 this.classList.add('active');
                 currentSearchType = this.dataset.type;
                 updateSearchUI();
+            });
+        });
+        
+        // Application search type buttons
+        document.querySelectorAll('#applicationSearch .search-type button').forEach(btn => {
+            btn.addEventListener('click', function() {
+                document.querySelectorAll('#applicationSearch .search-type button').forEach(b => b.classList.remove('active'));
+                this.classList.add('active');
+                currentSearchType = this.dataset.type;
+                updateAppSearchUI();
             });
         });
         
@@ -584,7 +876,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 input.required = true;
                 geoFilters.classList.remove('active');
                 
-                // Update placeholder
                 const placeholders = {
                     'callsign': 'Enter call sign...',
                     'frn': 'Enter FRN...',
@@ -595,7 +886,29 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             }
         }
         
-        // Load states
+        function updateAppSearchUI() {
+            const input = document.getElementById('appSearchInput');
+            const statusSelect = document.getElementById('appStatusSelect');
+            
+            if (currentSearchType === 'application_status') {
+                input.style.display = 'none';
+                input.required = false;
+                statusSelect.style.display = 'block';
+                statusSelect.required = true;
+            } else if (currentSearchType === 'recent_applications') {
+                input.style.display = 'none';
+                input.required = false;
+                statusSelect.style.display = 'none';
+                statusSelect.required = false;
+            } else {
+                input.style.display = 'block';
+                input.required = true;
+                statusSelect.style.display = 'none';
+                statusSelect.required = false;
+                input.placeholder = 'Enter application file number...';
+            }
+        }
+        
         async function loadStates() {
             try {
                 const response = await fetch('/api/regions');
@@ -610,8 +923,15 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             }
         }
         
-        // Search form
+        // License search form
         document.getElementById('searchForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            currentPage = 1;
+            await performSearch();
+        });
+        
+        // Application search form
+        document.getElementById('appSearchForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             currentPage = 1;
             await performSearch();
@@ -631,13 +951,22 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 per_page: 50
             };
             
-            if (currentSearchType === 'geographic') {
-                currentSearchParams.region = document.getElementById('regionSelect').value;
-                currentSearchParams.state = document.getElementById('stateSelect').value;
-                currentSearchParams.county = document.getElementById('countyInput').value;
-                currentSearchParams.city = document.getElementById('cityInput').value;
+            if (currentCategory === 'license') {
+                if (currentSearchType === 'geographic') {
+                    currentSearchParams.region = document.getElementById('regionSelect').value;
+                    currentSearchParams.state = document.getElementById('stateSelect').value;
+                    currentSearchParams.city = document.getElementById('cityInput').value;
+                } else {
+                    currentSearchParams.q = document.getElementById('searchInput').value;
+                }
             } else {
-                currentSearchParams.q = document.getElementById('searchInput').value;
+                if (currentSearchType === 'application_status') {
+                    currentSearchParams.q = document.getElementById('appStatusSelect').value;
+                } else if (currentSearchType === 'recent_applications') {
+                    currentSearchParams.q = '';
+                } else {
+                    currentSearchParams.q = document.getElementById('appSearchInput').value;
+                }
             }
             
             try {
@@ -672,20 +1001,43 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 return;
             }
             
-            // Build table
+            // Build table based on result type
+            const isApplication = data.results[0].type === 'application';
             let html = '<table><thead><tr>';
-            html += '<th>Call Sign</th><th>Name</th><th>Status</th><th>Grant Date</th><th>Expiration</th><th>Location</th>';
+            
+            if (isApplication) {
+                html += '<th>Type</th><th>File Number</th><th>Call Sign</th><th>Purpose</th><th>Status</th><th>Receipt Date</th><th>Applicant</th>';
+            } else {
+                html += '<th>Type</th><th>Call Sign</th><th>Name</th><th>Status</th><th>Grant Date</th><th>Expiration</th><th>Location</th>';
+            }
+            
             html += '</tr></thead><tbody>';
             
             data.results.forEach(row => {
-                const statusClass = `status-${row.license_status || 'U'}`;
                 html += '<tr>';
-                html += `<td><strong>${row.call_sign || ''}</strong></td>`;
-                html += `<td>${row.entity_name || ''}</td>`;
-                html += `<td><span class="license-status ${statusClass}">${row.license_status || ''}</span></td>`;
-                html += `<td>${row.grant_date || ''}</td>`;
-                html += `<td>${row.expired_date || ''}</td>`;
-                html += `<td>${row.address || ''}</td>`;
+                
+                if (isApplication) {
+                    const typeClass = 'badge-application';
+                    const statusClass = `status-${row.application_status_code || 'P'}`;
+                    html += `<td><span class="badge ${typeClass}">APP</span></td>`;
+                    html += `<td><strong>${row.uls_file_number || ''}</strong></td>`;
+                    html += `<td>${row.call_sign || 'N/A'}</td>`;
+                    html += `<td>${row.application_purpose || ''}</td>`;
+                    html += `<td><span class="status-badge ${statusClass}">${row.application_status || ''}</span></td>`;
+                    html += `<td>${row.receipt_date || ''}</td>`;
+                    html += `<td>${row.entity_name || ''}</td>`;
+                } else {
+                    const typeClass = 'badge-license';
+                    const statusClass = `status-${row.license_status || 'U'}`;
+                    html += `<td><span class="badge ${typeClass}">LIC</span></td>`;
+                    html += `<td><strong>${row.call_sign || ''}</strong></td>`;
+                    html += `<td>${row.entity_name || ''}</td>`;
+                    html += `<td><span class="status-badge ${statusClass}">${row.license_status || ''}</span></td>`;
+                    html += `<td>${row.grant_date || ''}</td>`;
+                    html += `<td>${row.expired_date || ''}</td>`;
+                    html += `<td>${row.address || ''}</td>`;
+                }
+                
                 html += '</tr>';
             });
             
@@ -700,7 +1052,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 pageHtml += `<button onclick="changePage(${data.page - 1})">Previous</button>`;
             }
             
-            // Show page numbers
             const maxPages = Math.min(data.total_pages, 10);
             const startPage = Math.max(1, data.page - 5);
             const endPage = Math.min(data.total_pages, startPage + 9);
@@ -722,6 +1073,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         function changePage(page) {
             currentPage = page;
             performSearch();
+            window.scrollTo(0, 0);
         }
         
         // Export to CSV
