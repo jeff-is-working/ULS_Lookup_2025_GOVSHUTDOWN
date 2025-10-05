@@ -2,6 +2,7 @@
 """
 FCC ULS Database Web Application
 Provides search interface and CSV export for ULS license and application data
+Includes PDF license generation for amateur radio licenses
 """
 
 from flask import Flask, render_template, request, jsonify, send_file, Response
@@ -12,6 +13,7 @@ import os
 from datetime import datetime
 from functools import lru_cache
 import logging
+from license_pdf_generator import LicensePDFGenerator, create_license_pdf_from_callsign
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -34,11 +36,15 @@ def get_db():
 
 def query_db(query, args=(), one=False):
     """Execute database query"""
-    conn = get_db()
-    cur = conn.execute(query, args)
-    rv = cur.fetchall()
-    conn.close()
-    return (rv[0] if rv else None) if one else rv
+    try:
+        conn = get_db()
+        cur = conn.execute(query, args)
+        rv = cur.fetchall()
+        conn.close()
+        return (rv[0] if rv else None) if one else rv
+    except Exception as e:
+        logger.error(f"Database query error: {e}")
+        return None if one else []
 
 @lru_cache(maxsize=128)
 def get_states():
@@ -70,6 +76,8 @@ def search():
     query_value = request.args.get('q', '').strip()
     page = int(request.args.get('page', 1))
     per_page = int(request.args.get('per_page', app.config['PAGE_SIZE']))
+    sort_by = request.args.get('sort_by', 'call_sign')  # Default sort column
+    sort_order = request.args.get('sort_order', 'asc')  # asc or desc
     
     # Validate inputs
     if not query_value and search_type not in ['geographic', 'recent_applications']:
@@ -78,15 +86,19 @@ def search():
     if per_page > 200:
         per_page = 200
     
+    # Validate sort order
+    if sort_order.lower() not in ['asc', 'desc']:
+        sort_order = 'asc'
+    
     offset = (page - 1) * per_page
     
     # Route to appropriate search handler
     if search_type in ['application_file', 'application_status', 'recent_applications']:
-        return search_applications(query_value, page, per_page, offset, search_type)
+        return search_applications(query_value, page, per_page, offset, search_type, sort_by, sort_order)
     else:
-        return search_licenses(query_value, page, per_page, offset, search_type)
+        return search_licenses(query_value, page, per_page, offset, search_type, sort_by, sort_order)
 
-def search_licenses(query_value, page, per_page, offset, search_type):
+def search_licenses(query_value, page, per_page, offset, search_type, sort_by='call_sign', sort_order='asc'):
     """Search for license data"""
     base_query = """
         SELECT DISTINCT
@@ -98,7 +110,7 @@ def search_licenses(query_value, page, per_page, offset, search_type):
             h.expired_date,
             h.cancellation_date,
             h.license_status,
-            e.entity_name,
+            COALESCE(e.entity_name, e.last_name || ', ' || e.first_name) as entity_name,
             e.first_name,
             e.last_name,
             e.frn,
@@ -202,6 +214,23 @@ def search_licenses(query_value, page, per_page, offset, search_type):
             where_clause = "WHERE h.license_status = ?"
         params.append(status_filter)
     
+    # Validate and build ORDER BY clause
+    valid_sort_columns = {
+        'call_sign': 'h.call_sign',
+        'entity_name': 'entity_name',
+        'license_status': 'h.license_status',
+        'grant_date': 'h.grant_date',
+        'expired_date': 'h.expired_date',
+        'state': 'e.state',
+        'city': 'e.city',
+        'frn': 'e.frn',
+        'unique_system_identifier': 'h.unique_system_identifier',
+        'radio_service_code': 'h.radio_service_code'
+    }
+    
+    order_column = valid_sort_columns.get(sort_by, 'h.call_sign')
+    order_clause = f"ORDER BY {order_column} {sort_order.upper()}, h.call_sign ASC"
+    
     # Get total count
     count_query = f"""
         SELECT COUNT(DISTINCT h.unique_system_identifier) as total 
@@ -213,8 +242,8 @@ def search_licenses(query_value, page, per_page, offset, search_type):
     total_result = query_db(count_query, params, one=True)
     total_count = total_result['total'] if total_result else 0
     
-    # Execute main query with pagination
-    full_query = f"{base_query} {where_clause} ORDER BY h.call_sign LIMIT ? OFFSET ?"
+    # Execute main query with pagination and sorting
+    full_query = f"{base_query} {where_clause} {order_clause} LIMIT ? OFFSET ?"
     params.extend([per_page, offset])
     
     results = query_db(full_query, params)
@@ -222,20 +251,29 @@ def search_licenses(query_value, page, per_page, offset, search_type):
     # Format results
     formatted_results = []
     for row in results:
+        # Handle entity name properly
+        entity_name = row['entity_name'] if row['entity_name'] else ''
+        if not entity_name and row['first_name'] and row['last_name']:
+            entity_name = f"{row['first_name']} {row['last_name']}"
+        elif not entity_name and row['last_name']:
+            entity_name = row['last_name']
+        
         formatted_results.append({
             'type': 'license',
             'unique_system_identifier': row['unique_system_identifier'],
-            'call_sign': row['call_sign'],
-            'uls_file_number': row['uls_file_number'],
-            'radio_service_code': row['radio_service_code'],
-            'grant_date': row['grant_date'],
-            'expired_date': row['expired_date'],
-            'license_status': row['license_status'],
-            'entity_name': row['entity_name'] or f"{row['first_name'] or ''} {row['last_name'] or ''}".strip(),
-            'frn': row['frn'],
+            'call_sign': row['call_sign'] if row['call_sign'] else '',
+            'uls_file_number': row['uls_file_number'] if row['uls_file_number'] else '',
+            'radio_service_code': row['radio_service_code'] if row['radio_service_code'] else '',
+            'grant_date': row['grant_date'] if row['grant_date'] else '',
+            'expired_date': row['expired_date'] if row['expired_date'] else '',
+            'license_status': row['license_status'] if row['license_status'] else '',
+            'entity_name': entity_name,
+            'frn': row['frn'] if row['frn'] else '',
             'address': f"{row['street_address'] or ''}, {row['city'] or ''}, {row['state'] or ''} {row['zip_code'] or ''}".strip(', '),
-            'email': row['email'],
-            'phone': row['phone']
+            'city': row['city'] if row['city'] else '',
+            'state': row['state'] if row['state'] else '',
+            'email': row['email'] if row['email'] else '',
+            'phone': row['phone'] if row['phone'] else ''
         })
     
     return jsonify({
@@ -243,10 +281,12 @@ def search_licenses(query_value, page, per_page, offset, search_type):
         'total': total_count,
         'page': page,
         'per_page': per_page,
-        'total_pages': (total_count + per_page - 1) // per_page
+        'total_pages': (total_count + per_page - 1) // per_page,
+        'sort_by': sort_by,
+        'sort_order': sort_order
     })
 
-def search_applications(query_value, page, per_page, offset, search_type):
+def search_applications(query_value, page, per_page, offset, search_type, sort_by='receipt_date', sort_order='desc'):
     """Search for application data"""
     base_query = """
         SELECT DISTINCT
@@ -257,7 +297,7 @@ def search_applications(query_value, page, per_page, offset, search_type):
             ad.application_status,
             ad.receipt_date,
             ad.notification_date,
-            e.entity_name,
+            COALESCE(e.entity_name, e.last_name || ', ' || e.first_name) as entity_name,
             e.first_name,
             e.last_name,
             e.frn,
@@ -292,6 +332,20 @@ def search_applications(query_value, page, per_page, offset, search_type):
     else:
         return jsonify({'error': 'Invalid application search type'}), 400
     
+    # Validate and build ORDER BY clause for applications
+    valid_sort_columns = {
+        'uls_file_number': 'ad.uls_file_number',
+        'call_sign': 'h.call_sign',
+        'application_purpose': 'ad.application_purpose',
+        'application_status': 'ad.application_status',
+        'receipt_date': 'ad.receipt_date',
+        'entity_name': 'entity_name',
+        'frn': 'e.frn'
+    }
+    
+    order_column = valid_sort_columns.get(sort_by, 'ad.receipt_date')
+    order_clause = f"ORDER BY {order_column} {sort_order.upper()}, ad.uls_file_number ASC"
+    
     # Get total count
     count_query = f"""
         SELECT COUNT(DISTINCT ad.uls_file_number) as total 
@@ -304,9 +358,8 @@ def search_applications(query_value, page, per_page, offset, search_type):
     total_result = query_db(count_query, params, one=True)
     total_count = total_result['total'] if total_result else 0
     
-    # Execute main query with pagination
-    order_by = "ORDER BY ad.receipt_date DESC" if search_type == 'recent_applications' else "ORDER BY ad.uls_file_number"
-    full_query = f"{base_query} {where_clause} {order_by} LIMIT ? OFFSET ?"
+    # Execute main query with pagination and sorting
+    full_query = f"{base_query} {where_clause} {order_clause} LIMIT ? OFFSET ?"
     params.extend([per_page, offset])
     
     results = query_db(full_query, params)
@@ -340,24 +393,31 @@ def search_applications(query_value, page, per_page, offset, search_type):
             'I': 'In Progress'
         }
         
+        # Handle entity name properly
+        entity_name = row['entity_name'] if row['entity_name'] else ''
+        if not entity_name and row['first_name'] and row['last_name']:
+            entity_name = f"{row['first_name']} {row['last_name']}"
+        elif not entity_name and row['last_name']:
+            entity_name = row['last_name']
+        
         formatted_results.append({
             'type': 'application',
             'unique_system_identifier': row['unique_system_identifier'],
-            'uls_file_number': row['uls_file_number'],
-            'ebf_number': row['ebf_number'],
-            'call_sign': row['call_sign'],
-            'radio_service_code': row['radio_service_code'],
-            'application_purpose': purpose_map.get(row['application_purpose'], row['application_purpose']),
-            'application_purpose_code': row['application_purpose'],
-            'application_status': status_map.get(row['application_status'], row['application_status']),
-            'application_status_code': row['application_status'],
-            'receipt_date': row['receipt_date'],
-            'notification_date': row['notification_date'],
-            'entity_name': row['entity_name'] or f"{row['first_name'] or ''} {row['last_name'] or ''}".strip(),
-            'frn': row['frn'],
+            'uls_file_number': row['uls_file_number'] if row['uls_file_number'] else '',
+            'ebf_number': row['ebf_number'] if row['ebf_number'] else '',
+            'call_sign': row['call_sign'] if row['call_sign'] else 'N/A',
+            'radio_service_code': row['radio_service_code'] if row['radio_service_code'] else '',
+            'application_purpose': purpose_map.get(row['application_purpose'], row['application_purpose'] or ''),
+            'application_purpose_code': row['application_purpose'] if row['application_purpose'] else '',
+            'application_status': status_map.get(row['application_status'], row['application_status'] or ''),
+            'application_status_code': row['application_status'] if row['application_status'] else '',
+            'receipt_date': row['receipt_date'] if row['receipt_date'] else '',
+            'notification_date': row['notification_date'] if row['notification_date'] else '',
+            'entity_name': entity_name,
+            'frn': row['frn'] if row['frn'] else '',
             'address': f"{row['street_address'] or ''}, {row['city'] or ''}, {row['state'] or ''} {row['zip_code'] or ''}".strip(', '),
-            'email': row['email'],
-            'phone': row['phone']
+            'email': row['email'] if row['email'] else '',
+            'phone': row['phone'] if row['phone'] else ''
         })
     
     return jsonify({
@@ -365,7 +425,9 @@ def search_applications(query_value, page, per_page, offset, search_type):
         'total': total_count,
         'page': page,
         'per_page': per_page,
-        'total_pages': (total_count + per_page - 1) // per_page
+        'total_pages': (total_count + per_page - 1) // per_page,
+        'sort_by': sort_by,
+        'sort_order': sort_order
     })
 
 @app.route('/api/export/csv', methods=['POST'])
@@ -395,7 +457,7 @@ def export_licenses_csv(data, search_type, query_value):
             h.grant_date,
             h.expired_date,
             h.license_status,
-            e.entity_name,
+            COALESCE(e.entity_name, e.last_name || ', ' || e.first_name) as entity_name,
             e.first_name,
             e.last_name,
             e.frn,
@@ -439,11 +501,11 @@ def export_licenses_csv(data, search_type, query_value):
     # Write data
     for row in results:
         writer.writerow([
-            row['call_sign'], row['uls_file_number'], row['unique_system_identifier'],
-            row['radio_service_code'], row['grant_date'], row['expired_date'],
-            row['license_status'], row['entity_name'], row['first_name'],
-            row['last_name'], row['frn'], row['street_address'],
-            row['city'], row['state'], row['zip_code'], row['email'], row['phone']
+            row['call_sign'] or '', row['uls_file_number'] or '', row['unique_system_identifier'] or '',
+            row['radio_service_code'] or '', row['grant_date'] or '', row['expired_date'] or '',
+            row['license_status'] or '', row['entity_name'] or '', row['first_name'] or '',
+            row['last_name'] or '', row['frn'] or '', row['street_address'] or '',
+            row['city'] or '', row['state'] or '', row['zip_code'] or '', row['email'] or '', row['phone'] or ''
         ])
     
     # Create response
@@ -471,7 +533,7 @@ def export_applications_csv(data, search_type, query_value):
             ad.notification_date,
             h.call_sign,
             h.radio_service_code,
-            e.entity_name,
+            COALESCE(e.entity_name, e.last_name || ', ' || e.first_name) as entity_name,
             e.first_name,
             e.last_name,
             e.frn,
@@ -515,13 +577,13 @@ def export_applications_csv(data, search_type, query_value):
     # Write data
     for row in results:
         writer.writerow([
-            row['uls_file_number'], row['ebf_number'], row['unique_system_identifier'],
-            row['call_sign'], row['radio_service_code'],
-            row['application_purpose'], row['application_status'],
-            row['receipt_date'], row['notification_date'],
-            row['entity_name'], row['first_name'], row['last_name'], row['frn'],
-            row['street_address'], row['city'], row['state'], row['zip_code'],
-            row['email'], row['phone']
+            row['uls_file_number'] or '', row['ebf_number'] or '', row['unique_system_identifier'] or '',
+            row['call_sign'] or '', row['radio_service_code'] or '',
+            row['application_purpose'] or '', row['application_status'] or '',
+            row['receipt_date'] or '', row['notification_date'] or '',
+            row['entity_name'] or '', row['first_name'] or '', row['last_name'] or '', row['frn'] or '',
+            row['street_address'] or '', row['city'] or '', row['state'] or '', row['zip_code'] or '',
+            row['email'] or '', row['phone'] or ''
         ])
     
     # Create response
@@ -618,6 +680,30 @@ def get_application_detail(file_number):
         'attachments': [dict(a) for a in attachments]
     })
 
+@app.route('/api/license/<callsign>/pdf')
+def generate_license_pdf(callsign):
+    """Generate a PDF license for a given callsign"""
+    try:
+        conn = get_db()
+        pdf_buffer = create_license_pdf_from_callsign(conn, callsign)
+        conn.close()
+        
+        if pdf_buffer is None:
+            return jsonify({'error': 'Failed to generate PDF'}), 500
+        
+        return Response(
+            pdf_buffer.getvalue(),
+            mimetype='application/pdf',
+            headers={
+                'Content-Disposition': f'attachment; filename={callsign}_license.pdf'
+            }
+        )
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 404
+    except Exception as e:
+        logger.error(f"Error generating PDF: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
 @app.route('/api/stats')
 def get_stats():
     """Get database statistics"""
@@ -688,7 +774,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; }
-        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .container { max-width: 1600px; margin: 0 auto; padding: 20px; }
         .header { background: #2c3e50; color: white; padding: 30px 0; margin: -20px -20px 30px; }
         .header h1 { text-align: center; font-size: 2em; }
         .header p { text-align: center; margin-top: 10px; opacity: 0.9; }
@@ -706,37 +792,43 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .search-form button:hover { background: #229954; }
         .geographic-filters { display: none; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-bottom: 20px; }
         .geographic-filters.active { display: grid; }
-        .results { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .results { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); overflow-x: auto; }
         .results-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding-bottom: 10px; border-bottom: 2px solid #ecf0f1; }
         .results-count { color: #7f8c8d; }
         .export-btn { padding: 8px 16px; background: #95a5a6; color: white; border: none; border-radius: 5px; cursor: pointer; }
         .export-btn:hover { background: #7f8c8d; }
-        table { width: 100%; border-collapse: collapse; }
-        th { background: #ecf0f1; padding: 12px; text-align: left; font-weight: 600; }
-        td { padding: 12px; border-bottom: 1px solid #ecf0f1; }
+        table { width: 100%; border-collapse: collapse; min-width: 900px; }
+        th { background: #ecf0f1; padding: 12px 8px; text-align: left; font-weight: 600; cursor: pointer; user-select: none; position: relative; }
+        th:hover { background: #d5dbdb; }
+        th.sortable::after { content: ' ⇅'; opacity: 0.3; font-size: 12px; }
+        th.sorted-asc::after { content: ' ↑'; opacity: 1; color: #3498db; }
+        th.sorted-desc::after { content: ' ↓'; opacity: 1; color: #3498db; }
+        td { padding: 12px 8px; border-bottom: 1px solid #ecf0f1; }
         tr:hover { background: #f8f9fa; }
-        .pagination { display: flex; justify-content: center; gap: 5px; margin-top: 20px; }
+        .pagination { display: flex; justify-content: center; gap: 5px; margin-top: 20px; flex-wrap: wrap; }
         .pagination button { padding: 8px 12px; border: 1px solid #ddd; background: white; cursor: pointer; border-radius: 3px; }
         .pagination button:hover { background: #ecf0f1; }
         .pagination button.active { background: #3498db; color: white; border-color: #3498db; }
         .pagination button:disabled { opacity: 0.5; cursor: not-allowed; }
         .loading { text-align: center; padding: 40px; color: #7f8c8d; }
         .error { background: #e74c3c; color: white; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
-        .badge { padding: 3px 8px; border-radius: 3px; font-size: 12px; font-weight: bold; display: inline-block; }
+        .badge { padding: 3px 8px; border-radius: 3px; font-size: 11px; font-weight: bold; display: inline-block; white-space: nowrap; }
         .badge-license { background: #3498db; color: white; }
         .badge-application { background: #9b59b6; color: white; }
-        .status-badge { padding: 2px 8px; border-radius: 3px; font-size: 12px; font-weight: bold; }
+        .status-badge { padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: bold; white-space: nowrap; }
         .status-A { background: #27ae60; color: white; }
         .status-E { background: #e67e22; color: white; }
         .status-C { background: #e74c3c; color: white; }
         .status-P { background: #f39c12; color: white; }
         .status-G { background: #27ae60; color: white; }
         .status-D { background: #95a5a6; color: white; }
+        .action-btn { padding: 4px 8px; margin: 2px; background: #e74c3c; color: white; border: none; border-radius: 3px; cursor: pointer; font-size: 11px; white-space: nowrap; }
+        .action-btn:hover { background: #c0392b; }
         @media (max-width: 768px) {
             .search-form { flex-direction: column; }
             .tabs { flex-direction: column; }
-            table { font-size: 14px; }
-            th, td { padding: 8px; }
+            table { font-size: 13px; }
+            th, td { padding: 6px 4px; }
         }
     </style>
 </head>
@@ -822,6 +914,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         let currentSearchType = 'callsign';
         let currentSearchParams = {};
         let currentPage = 1;
+        let currentSortBy = 'call_sign';
+        let currentSortOrder = 'asc';
         
         // Tab switching
         document.querySelectorAll('.tabs .tab').forEach(tab => {
@@ -836,8 +930,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 
                 if (currentCategory === 'application') {
                     currentSearchType = 'application_file';
+                    currentSortBy = 'receipt_date';
+                    currentSortOrder = 'desc';
                 } else {
                     currentSearchType = 'callsign';
+                    currentSortBy = 'call_sign';
+                    currentSortOrder = 'asc';
                 }
             });
         });
@@ -948,7 +1046,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             currentSearchParams = {
                 type: currentSearchType,
                 page: currentPage,
-                per_page: 50
+                per_page: 50,
+                sort_by: currentSortBy,
+                sort_order: currentSortOrder
             };
             
             if (currentCategory === 'license') {
@@ -986,6 +1086,18 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             }
         }
         
+        function sortBy(column) {
+            if (currentSortBy === column) {
+                // Toggle sort order
+                currentSortOrder = currentSortOrder === 'asc' ? 'desc' : 'asc';
+            } else {
+                currentSortBy = column;
+                currentSortOrder = 'asc';
+            }
+            currentPage = 1;
+            performSearch();
+        }
+        
         function displayResults(data) {
             const results = document.getElementById('results');
             const resultsCount = document.getElementById('resultsCount');
@@ -1006,9 +1118,23 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             let html = '<table><thead><tr>';
             
             if (isApplication) {
-                html += '<th>Type</th><th>File Number</th><th>Call Sign</th><th>Purpose</th><th>Status</th><th>Receipt Date</th><th>Applicant</th>';
+                html += `<th class="sortable ${data.sort_by === 'uls_file_number' ? 'sorted-' + data.sort_order : ''}" onclick="sortBy('uls_file_number')">File Number</th>`;
+                html += `<th class="sortable ${data.sort_by === 'call_sign' ? 'sorted-' + data.sort_order : ''}" onclick="sortBy('call_sign')">Call Sign</th>`;
+                html += `<th class="sortable ${data.sort_by === 'application_purpose' ? 'sorted-' + data.sort_order : ''}" onclick="sortBy('application_purpose')">Purpose</th>`;
+                html += `<th class="sortable ${data.sort_by === 'application_status' ? 'sorted-' + data.sort_order : ''}" onclick="sortBy('application_status')">Status</th>`;
+                html += `<th class="sortable ${data.sort_by === 'receipt_date' ? 'sorted-' + data.sort_order : ''}" onclick="sortBy('receipt_date')">Receipt Date</th>`;
+                html += `<th class="sortable ${data.sort_by === 'entity_name' ? 'sorted-' + data.sort_order : ''}" onclick="sortBy('entity_name')">Applicant</th>`;
+                html += `<th class="sortable ${data.sort_by === 'frn' ? 'sorted-' + data.sort_order : ''}" onclick="sortBy('frn')">FRN</th>`;
             } else {
-                html += '<th>Type</th><th>Call Sign</th><th>Name</th><th>Status</th><th>Grant Date</th><th>Expiration</th><th>Location</th>';
+                html += `<th class="sortable ${data.sort_by === 'call_sign' ? 'sorted-' + data.sort_order : ''}" onclick="sortBy('call_sign')">Call Sign</th>`;
+                html += `<th class="sortable ${data.sort_by === 'entity_name' ? 'sorted-' + data.sort_order : ''}" onclick="sortBy('entity_name')">Name</th>`;
+                html += `<th class="sortable ${data.sort_by === 'frn' ? 'sorted-' + data.sort_order : ''}" onclick="sortBy('frn')">FRN</th>`;
+                html += `<th class="sortable ${data.sort_by === 'unique_system_identifier' ? 'sorted-' + data.sort_order : ''}" onclick="sortBy('unique_system_identifier')">ULS ID</th>`;
+                html += `<th class="sortable ${data.sort_by === 'license_status' ? 'sorted-' + data.sort_order : ''}" onclick="sortBy('license_status')">Status</th>`;
+                html += `<th class="sortable ${data.sort_by === 'grant_date' ? 'sorted-' + data.sort_order : ''}" onclick="sortBy('grant_date')">Grant Date</th>`;
+                html += `<th class="sortable ${data.sort_by === 'expired_date' ? 'sorted-' + data.sort_order : ''}" onclick="sortBy('expired_date')">Expiration</th>`;
+                html += `<th class="sortable ${data.sort_by === 'state' ? 'sorted-' + data.sort_order : ''}" onclick="sortBy('state')">State</th>`;
+                html += '<th>Actions</th>';
             }
             
             html += '</tr></thead><tbody>';
@@ -1017,25 +1143,31 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 html += '<tr>';
                 
                 if (isApplication) {
-                    const typeClass = 'badge-application';
                     const statusClass = `status-${row.application_status_code || 'P'}`;
-                    html += `<td><span class="badge ${typeClass}">APP</span></td>`;
                     html += `<td><strong>${row.uls_file_number || ''}</strong></td>`;
                     html += `<td>${row.call_sign || 'N/A'}</td>`;
                     html += `<td>${row.application_purpose || ''}</td>`;
                     html += `<td><span class="status-badge ${statusClass}">${row.application_status || ''}</span></td>`;
                     html += `<td>${row.receipt_date || ''}</td>`;
                     html += `<td>${row.entity_name || ''}</td>`;
+                    html += `<td>${row.frn || ''}</td>`;
                 } else {
-                    const typeClass = 'badge-license';
                     const statusClass = `status-${row.license_status || 'U'}`;
-                    html += `<td><span class="badge ${typeClass}">LIC</span></td>`;
                     html += `<td><strong>${row.call_sign || ''}</strong></td>`;
                     html += `<td>${row.entity_name || ''}</td>`;
+                    html += `<td>${row.frn || ''}</td>`;
+                    html += `<td>${row.unique_system_identifier || ''}</td>`;
                     html += `<td><span class="status-badge ${statusClass}">${row.license_status || ''}</span></td>`;
                     html += `<td>${row.grant_date || ''}</td>`;
                     html += `<td>${row.expired_date || ''}</td>`;
-                    html += `<td>${row.address || ''}</td>`;
+                    html += `<td>${row.state || ''}</td>`;
+                    
+                    // Add PDF download button for amateur radio licenses
+                    if (row.radio_service_code === 'HA' && row.call_sign) {
+                        html += `<td><button onclick="downloadLicensePDF('${row.call_sign}')" class="action-btn">📄 PDF</button></td>`;
+                    } else {
+                        html += `<td>-</td>`;
+                    }
                 }
                 
                 html += '</tr>';
@@ -1076,11 +1208,17 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             window.scrollTo(0, 0);
         }
         
+        function downloadLicensePDF(callsign) {
+            window.location.href = `/api/license/${callsign}/pdf`;
+        }
+        
         // Export to CSV
         document.getElementById('exportBtn').addEventListener('click', async () => {
             const params = {...currentSearchParams};
             delete params.page;
             delete params.per_page;
+            delete params.sort_by;
+            delete params.sort_order;
             
             try {
                 const response = await fetch('/api/export/csv', {
