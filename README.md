@@ -23,20 +23,8 @@ python3 uls_importer.py --db uls.db --import-dir /path/to/uls/files
 
 
 ## 3. Apply daily db updates
-python3 uls_importer.py --db uls.db --import-file l_am_wed.zip --import-type daily --replace
-python3 uls_importer.py --db uls.db --import-file a_am_wed.zip --import-type daily --replace
-python3 uls_importer.py --db uls.db --import-file l_am_thu.zip --import-type daily --replace
-python3 uls_importer.py --db uls.db --import-file a_am_thu.zip --import-type daily --replace
-python3 uls_importer.py --db uls.db --import-file l_am_fri.zip --import-type daily --replace
-python3 uls_importer.py --db uls.db --import-file a_am_fri.zip --import-type daily --replace
-python3 uls_importer.py --db uls.db --import-file l_am_sat.zip --import-type daily --replace
-python3 uls_importer.py --db uls.db --import-file a_am_sat.zip --import-type daily --replace
-python3 uls_importer.py --db uls.db --import-file l_am_sun.zip --import-type daily --replace
-python3 uls_importer.py --db uls.db --import-file a_am_sun.zip --import-type daily --replace
-python3 uls_importer.py --db uls.db --import-file l_am_mon.zip --import-type daily --replace
-python3 uls_importer.py --db uls.db --import-file a_am_mon.zip --import-type daily --replace
-python3 uls_importer.py --db uls.db --import-file l_am_tue.zip --import-type daily --replace
-python3 uls_importer.py --db uls.db --import-file a_am_tue.zip --import-type daily --replace
+python3 uls_importer.py --db uls.db --import-dir . --pattern "*_am_*.zip" --import-type daily
+
 
 ## 4. Check status
 python3 uls_importer.py --db uls.db --status
