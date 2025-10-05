@@ -21,8 +21,9 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.config['DATABASE'] = os.environ.get('ULS_DATABASE', 'uls.db')
-app.config['MAX_RESULTS'] = 1000
-app.config['PAGE_SIZE'] = 50
+app.config['MAX_EXPORT_RESULTS'] = 50000  # Increased from 1000
+app.config['DEFAULT_PAGE_SIZE'] = 50
+app.config['MAX_PAGE_SIZE'] = 1000  # Allow up to 1000 results per page
 
 # Database connection
 def get_db():
@@ -75,16 +76,20 @@ def search():
     search_type = request.args.get('type', 'callsign')
     query_value = request.args.get('q', '').strip()
     page = int(request.args.get('page', 1))
-    per_page = int(request.args.get('per_page', app.config['PAGE_SIZE']))
+    per_page = int(request.args.get('per_page', app.config['DEFAULT_PAGE_SIZE']))
     sort_by = request.args.get('sort_by', 'call_sign')  # Default sort column
     sort_order = request.args.get('sort_order', 'asc')  # asc or desc
+    active_only = request.args.get('active_only', 'false').lower() == 'true'  # New filter
     
     # Validate inputs
     if not query_value and search_type not in ['geographic', 'recent_applications']:
         return jsonify({'error': 'Search query required'}), 400
     
-    if per_page > 200:
-        per_page = 200
+    # Validate per_page with higher limit
+    if per_page < 1:
+        per_page = app.config['DEFAULT_PAGE_SIZE']
+    if per_page > app.config['MAX_PAGE_SIZE']:
+        per_page = app.config['MAX_PAGE_SIZE']
     
     # Validate sort order
     if sort_order.lower() not in ['asc', 'desc']:
@@ -96,9 +101,9 @@ def search():
     if search_type in ['application_file', 'application_status', 'recent_applications']:
         return search_applications(query_value, page, per_page, offset, search_type, sort_by, sort_order)
     else:
-        return search_licenses(query_value, page, per_page, offset, search_type, sort_by, sort_order)
+        return search_licenses(query_value, page, per_page, offset, search_type, sort_by, sort_order, active_only)
 
-def search_licenses(query_value, page, per_page, offset, search_type, sort_by='call_sign', sort_order='asc'):
+def search_licenses(query_value, page, per_page, offset, search_type, sort_by='call_sign', sort_order='asc', active_only=False):
     """Search for license data"""
     base_query = """
         SELECT DISTINCT
@@ -205,14 +210,12 @@ def search_licenses(query_value, page, per_page, offset, search_type, sort_by='c
     else:
         return jsonify({'error': 'Invalid search type'}), 400
     
-    # Add license status filter
-    status_filter = request.args.get('status', '')
-    if status_filter:
+    # Add active license filter if requested
+    if active_only:
         if where_clause:
-            where_clause += " AND h.license_status = ?"
+            where_clause += " AND h.license_status = 'A'"
         else:
-            where_clause = "WHERE h.license_status = ?"
-        params.append(status_filter)
+            where_clause = "WHERE h.license_status = 'A'"
     
     # Validate and build ORDER BY clause
     valid_sort_columns = {
@@ -283,7 +286,8 @@ def search_licenses(query_value, page, per_page, offset, search_type, sort_by='c
         'per_page': per_page,
         'total_pages': (total_count + per_page - 1) // per_page,
         'sort_by': sort_by,
-        'sort_order': sort_order
+        'sort_order': sort_order,
+        'active_only': active_only
     })
 
 def search_applications(query_value, page, per_page, offset, search_type, sort_by='receipt_date', sort_order='desc'):
@@ -480,10 +484,60 @@ def export_licenses_csv(data, search_type, query_value):
     elif search_type == 'frn':
         where_clause = "WHERE e.frn = ?"
         params = [query_value]
-    # Add other search types as needed
+    elif search_type == 'uls_id':
+        where_clause = "WHERE h.unique_system_identifier = ?"
+        params = [query_value]
+    elif search_type == 'name':
+        name_parts = query_value.replace(',', ' ').split()
+        if len(name_parts) >= 2:
+            where_clause = """
+                WHERE (
+                    (UPPER(e.first_name) LIKE ? AND UPPER(e.last_name) LIKE ?) OR
+                    (UPPER(e.first_name) LIKE ? AND UPPER(e.last_name) LIKE ?) OR
+                    UPPER(e.entity_name) LIKE ?
+                )
+            """
+            params = [
+                f"%{name_parts[0].upper()}%", f"%{name_parts[1].upper()}%",
+                f"%{name_parts[1].upper()}%", f"%{name_parts[0].upper()}%",
+                f"%{query_value.upper()}%"
+            ]
+        else:
+            where_clause = """
+                WHERE (
+                    UPPER(e.first_name) LIKE ? OR 
+                    UPPER(e.last_name) LIKE ? OR 
+                    UPPER(e.entity_name) LIKE ?
+                )
+            """
+            params = [f"%{query_value.upper()}%"] * 3
+    elif search_type == 'geographic':
+        # Build geographic where clause
+        region = data.get('region', '')
+        state = data.get('state', '')
+        city = data.get('city', '')
+        
+        conditions = []
+        if state:
+            conditions.append("e.state = ?")
+            params.append(state.upper())
+        if city:
+            conditions.append("UPPER(e.city) LIKE ?")
+            params.append(f"%{city.upper()}%")
+        
+        if conditions:
+            where_clause = "WHERE " + " AND ".join(conditions)
     
-    # Limit exports to prevent abuse
-    full_query = f"{base_query} {where_clause} LIMIT {app.config['MAX_RESULTS']}"
+    # Add active license filter if requested
+    active_only = data.get('active_only', False)
+    if active_only:
+        if where_clause:
+            where_clause += " AND h.license_status = 'A'"
+        else:
+            where_clause = "WHERE h.license_status = 'A'"
+    
+    # Limit exports to reasonable amount (but much higher than before)
+    full_query = f"{base_query} {where_clause} ORDER BY h.call_sign LIMIT {app.config['MAX_EXPORT_RESULTS']}"
     results = query_db(full_query, params)
     
     # Create CSV
@@ -557,9 +611,12 @@ def export_applications_csv(data, search_type, query_value):
     elif search_type == 'application_status':
         where_clause = "WHERE ad.application_status = ?"
         params = [query_value.upper()]
+    elif search_type == 'recent_applications':
+        where_clause = "WHERE ad.receipt_date IS NOT NULL"
+        params = []
     
     # Limit exports
-    full_query = f"{base_query} {where_clause} LIMIT {app.config['MAX_RESULTS']}"
+    full_query = f"{base_query} {where_clause} ORDER BY ad.receipt_date DESC LIMIT {app.config['MAX_EXPORT_RESULTS']}"
     results = query_db(full_query, params)
     
     # Create CSV
@@ -786,15 +843,23 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .search-type button { padding: 10px 20px; border: 2px solid #3498db; background: white; color: #3498db; border-radius: 5px; cursor: pointer; transition: all 0.3s; }
         .search-type button.active { background: #3498db; color: white; }
         .search-type button:hover { background: #2980b9; color: white; border-color: #2980b9; }
-        .search-form { display: flex; gap: 10px; margin-bottom: 20px; }
-        .search-form input, .search-form select { flex: 1; padding: 12px; border: 1px solid #ddd; border-radius: 5px; font-size: 16px; }
+        .search-form { display: flex; gap: 10px; margin-bottom: 15px; align-items: center; flex-wrap: wrap; }
+        .search-form input, .search-form select { flex: 1; padding: 12px; border: 1px solid #ddd; border-radius: 5px; font-size: 16px; min-width: 200px; }
         .search-form button { padding: 12px 30px; background: #27ae60; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; }
         .search-form button:hover { background: #229954; }
+        .filter-options { display: flex; gap: 15px; align-items: center; flex-wrap: wrap; }
+        .checkbox-filter { display: flex; align-items: center; gap: 5px; }
+        .checkbox-filter input[type="checkbox"] { width: 18px; height: 18px; cursor: pointer; }
+        .checkbox-filter label { cursor: pointer; font-size: 14px; user-select: none; }
         .geographic-filters { display: none; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-bottom: 20px; }
         .geographic-filters.active { display: grid; }
         .results { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); overflow-x: auto; }
-        .results-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding-bottom: 10px; border-bottom: 2px solid #ecf0f1; }
+        .results-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding-bottom: 10px; border-bottom: 2px solid #ecf0f1; flex-wrap: wrap; gap: 10px; }
         .results-count { color: #7f8c8d; }
+        .results-controls { display: flex; gap: 10px; align-items: center; }
+        .per-page-selector { display: flex; gap: 5px; align-items: center; }
+        .per-page-selector label { font-size: 14px; color: #7f8c8d; }
+        .per-page-selector select { padding: 6px 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
         .export-btn { padding: 8px 16px; background: #95a5a6; color: white; border: none; border-radius: 5px; cursor: pointer; }
         .export-btn:hover { background: #7f8c8d; }
         table { width: 100%; border-collapse: collapse; min-width: 900px; }
@@ -824,6 +889,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .status-D { background: #95a5a6; color: white; }
         .action-btn { padding: 4px 8px; margin: 2px; background: #e74c3c; color: white; border: none; border-radius: 3px; cursor: pointer; font-size: 11px; white-space: nowrap; }
         .action-btn:hover { background: #c0392b; }
+        .export-note { font-size: 12px; color: #7f8c8d; margin-top: 5px; }
         @media (max-width: 768px) {
             .search-form { flex-direction: column; }
             .tabs { flex-direction: column; }
@@ -857,6 +923,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 <input type="text" id="searchInput" placeholder="Enter call sign..." required>
                 <button type="submit">Search</button>
             </form>
+            
+            <div class="filter-options">
+                <div class="checkbox-filter">
+                    <input type="checkbox" id="activeOnlyCheckbox">
+                    <label for="activeOnlyCheckbox">✓ Active Licenses Only</label>
+                </div>
+            </div>
             
             <div class="geographic-filters" id="geoFilters">
                 <select id="regionSelect">
@@ -900,8 +973,23 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         <div class="results" id="results" style="display: none;">
             <div class="results-header">
                 <div class="results-count" id="resultsCount"></div>
-                <button class="export-btn" id="exportBtn">Export to CSV</button>
+                <div class="results-controls">
+                    <div class="per-page-selector">
+                        <label for="perPageSelect">Show:</label>
+                        <select id="perPageSelect" onchange="changePerPage(this.value)">
+                            <option value="25">25</option>
+                            <option value="50" selected>50</option>
+                            <option value="100">100</option>
+                            <option value="200">200</option>
+                            <option value="500">500</option>
+                            <option value="1000">1000</option>
+                        </select>
+                        <span style="font-size: 14px; color: #7f8c8d;">per page</span>
+                    </div>
+                    <button class="export-btn" id="exportBtn">Export to CSV</button>
+                </div>
             </div>
+            <div class="export-note">CSV exports limited to 50,000 records</div>
             <div id="resultsTable"></div>
             <div class="pagination" id="pagination"></div>
         </div>
@@ -916,6 +1004,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         let currentPage = 1;
         let currentSortBy = 'call_sign';
         let currentSortOrder = 'asc';
+        let currentPerPage = 50;
+        let activeOnly = false;
         
         // Tab switching
         document.querySelectorAll('.tabs .tab').forEach(tab => {
@@ -958,6 +1048,11 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 currentSearchType = this.dataset.type;
                 updateAppSearchUI();
             });
+        });
+        
+        // Active only checkbox
+        document.getElementById('activeOnlyCheckbox').addEventListener('change', function() {
+            activeOnly = this.checked;
         });
         
         function updateSearchUI() {
@@ -1021,6 +1116,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             }
         }
         
+        function changePerPage(value) {
+            currentPerPage = parseInt(value);
+            currentPage = 1;
+            performSearch();
+        }
+        
         // License search form
         document.getElementById('searchForm').addEventListener('submit', async (e) => {
             e.preventDefault();
@@ -1046,12 +1147,15 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             currentSearchParams = {
                 type: currentSearchType,
                 page: currentPage,
-                per_page: 50,
+                per_page: currentPerPage,
                 sort_by: currentSortBy,
                 sort_order: currentSortOrder
             };
             
             if (currentCategory === 'license') {
+                // Add active only filter
+                currentSearchParams.active_only = activeOnly;
+                
                 if (currentSearchType === 'geographic') {
                     currentSearchParams.region = document.getElementById('regionSelect').value;
                     currentSearchParams.state = document.getElementById('stateSelect').value;
@@ -1104,7 +1208,15 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             const resultsTable = document.getElementById('resultsTable');
             const pagination = document.getElementById('pagination');
             
-            resultsCount.textContent = `Found ${data.total} results`;
+            // Update per page selector
+            document.getElementById('perPageSelect').value = data.per_page;
+            
+            let countText = `Found ${data.total.toLocaleString()} results`;
+            if (data.active_only) {
+                countText += ' (active only)';
+            }
+            countText += ` (showing ${data.results.length} on page ${data.page} of ${data.total_pages})`;
+            resultsCount.textContent = countText;
             
             if (data.results.length === 0) {
                 resultsTable.innerHTML = '<p>No results found</p>';
