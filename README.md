@@ -29,8 +29,7 @@ python3 uls_importer.py --db uls.db --import-dir . --pattern "*_am_*.zip" --impo
 ## 4. Check status
 python3 uls_importer.py --db uls.db --status
 
-## 5. Optimize database
-python3 uls_importer.py --db uls.db --vacuum --analyze
+
 
 # WebApp Run 
 
