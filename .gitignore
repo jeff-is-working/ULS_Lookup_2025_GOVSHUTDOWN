@@ -1,0 +1,16 @@
+# Database
+uls.db
+
+# FCC weekly exports
+l_amat.zip
+a_amat.zip
+
+# Virtual environment
+venv/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
